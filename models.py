@@ -170,6 +170,10 @@ class MultiPeriodDiscriminator(torch.nn.Module):
             DiscriminatorP(5),
             DiscriminatorP(7),
             DiscriminatorP(11),
+            DiscriminatorP(13),
+            DiscriminatorP(17),
+            DiscriminatorP(19),
+            DiscriminatorP(23),
         ])
 
     def forward(self, y, y_hat):

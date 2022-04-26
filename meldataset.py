@@ -2,19 +2,26 @@ import math
 import os
 import random
 import torch
+import glob
+import soundfile as sf
 import torch.utils.data
 import numpy as np
+import librosa
 from librosa.util import normalize
 from scipy.io.wavfile import read
 from librosa.filters import mel as librosa_mel_fn
+from audiomentations import Compose, AddGaussianSNR, ApplyImpulseResponse, Mp3Compression, SevenBandParametricEQ, AddBackgroundNoise
 
 MAX_WAV_VALUE = 32768.0
 
 
 def load_wav(full_path):
-    sampling_rate, data = read(full_path)
-    return data, sampling_rate
+    return sf.read(full_path)
 
+def _rms_norm(wav, db_level=-27):
+        r = 10 ** (db_level / 20)
+        a = np.sqrt((len(wav) * (r**2)) / np.sum(wav**2))
+        return wav * a
 
 def dynamic_range_compression(x, C=1, clip_val=1e-5):
     return np.log(np.clip(x, a_min=clip_val, a_max=None) * C)
@@ -73,20 +80,17 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
 
 
 def get_dataset_filelist(a):
-    with open(a.input_training_file, 'r', encoding='utf-8') as fi:
-        training_files = [os.path.join(a.input_wavs_dir, x.split('|')[0] + '.wav')
-                          for x in fi.read().split('\n') if len(x) > 0]
-
-    with open(a.input_validation_file, 'r', encoding='utf-8') as fi:
-        validation_files = [os.path.join(a.input_wavs_dir, x.split('|')[0] + '.wav')
-                            for x in fi.read().split('\n') if len(x) > 0]
-    return training_files, validation_files
+    all_files = glob.glob(os.path.join(a.input_wavs_dir, "**", "*.flac"), recursive=True)
+    all_files += glob.glob(os.path.join(a.input_wavs_dir, "**", "*.wav"), recursive=True)
+    assert len(all_files) > 100, "Not enough files in the dataset"
+    return all_files[:-100], all_files[-100:]
 
 
 class MelDataset(torch.utils.data.Dataset):
-    def __init__(self, training_files, segment_size, n_fft, num_mels,
+    def __init__(self, config, training_files, segment_size, n_fft, num_mels,
                  hop_size, win_size, sampling_rate,  fmin, fmax, split=True, shuffle=True, n_cache_reuse=1,
                  device=None, fmax_loss=None, fine_tuning=False, base_mels_path=None):
+        self.config = config
         self.audio_files = training_files
         random.seed(1234)
         if shuffle:
@@ -107,6 +111,14 @@ class MelDataset(torch.utils.data.Dataset):
         self.device = device
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
+        if self.augment:
+            self.augmentor = Compose([
+                AddBackgroundNoise(config.noise_path, max_snr_in_db=55, min_snr_in_db=20, p=0.5),
+                ApplyImpulseResponse(config.rir_path, leave_length_unchanged=True, p=0.666),
+                AddGaussianSNR(min_snr_in_db=30, max_snr_in_db=60, p=0.666),
+                SevenBandParametricEQ(p=0.666),
+                Mp3Compression(backend='pydub', max_bitrate=64, min_bitrate=16, p=0.1),
+            ])
 
     def __getitem__(self, index):
         filename = self.audio_files[index]
@@ -135,8 +147,13 @@ class MelDataset(torch.utils.data.Dataset):
                     audio = audio[:, audio_start:audio_start+self.segment_size]
                 else:
                     audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
+            if self.config.augment:
+                augmented_audio = self.augment(audio)
+            use_augmented = hasattr(augmented_audio, "shape") and (augmented_audio.shape == audio.shape)
+            if not use_augmented:
+                print("Shape missmatch, audio not augmented", audio.shape, augmented_audio.shape)
 
-            mel = mel_spectrogram(audio, self.n_fft, self.num_mels,
+            mel = mel_spectrogram(augmented_audio if use_augmented else audio, self.n_fft, self.num_mels,
                                   self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax,
                                   center=False)
         else:
@@ -166,3 +183,18 @@ class MelDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.audio_files)
+
+    def augment(self, audio):
+        target_len = audio.size(1)
+        augmented_audio = audio.squeeze(0).cpu().float().numpy()
+        augmented_audio = librosa.core.resample(augmented_audio, self.sampling_rate, 16000, res_type='linear')
+        augmented_audio = librosa.core.resample(
+            self.augmentor(
+                samples=augmented_audio,
+                sample_rate=16000,
+            ), 16000, self.sampling_rate, res_type='kaiser_fast')
+        augmented_audio = _rms_norm(augmented_audio)
+        diff = len(augmented_audio) - target_len
+        if diff > 0 and diff <= 3:
+            augmented_audio = augmented_audio[:-diff]
+        return torch.FloatTensor(augmented_audio).unsqueeze(0)

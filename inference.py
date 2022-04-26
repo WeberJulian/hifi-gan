@@ -48,8 +48,9 @@ def inference(a):
     generator.remove_weight_norm()
     with torch.no_grad():
         for i, filname in enumerate(filelist):
-            wav, sr = load_wav(os.path.join(a.input_wavs_dir, filname))
-            wav = wav / MAX_WAV_VALUE
+            wav, _ = load_wav(os.path.join(a.input_wavs_dir, filname))
+            if filname[-4:] == '.wav':
+                wav = wav / MAX_WAV_VALUE
             wav = torch.FloatTensor(wav).to(device)
             x = get_mel(wav.unsqueeze(0))
             y_g_hat = generator(x)
