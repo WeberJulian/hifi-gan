@@ -172,13 +172,13 @@ class MelDataset(torch.utils.data.Dataset):
             self.augmentor = Compose(
                 [
                     AddBackgroundNoise(
-                        config.noise_path, max_snr_in_db=55, min_snr_in_db=20, p=0.5
+                        config.noise_path, max_snr_in_db=55, min_snr_in_db=30, p=0.5
                     ),
                     ApplyImpulseResponse(
                         config.rir_path, leave_length_unchanged=True, p=0.666
                     ),
                     AddGaussianSNR(min_snr_in_db=30, max_snr_in_db=60, p=0.666),
-                    SevenBandParametricEQ(p=0.666),
+                    SevenBandParametricEQ(p=0.666, min_gain_db=-6.0, max_gain_db=6.0),
                     Mp3Compression(
                         backend="pydub", max_bitrate=64, min_bitrate=16, p=0.1
                     ),

@@ -36,6 +36,6 @@
     },
 
     "augment": true,
-    "rir_path": "/raid/datasets/RIRS_NOISES/",
+    "rir_path": "/raid/datasets/RIRS_NOISES/simulated_rirs/smallroom/",
     "noise_path": "/raid/datasets/DNS-Challenge/noise/"
 }
