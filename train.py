@@ -136,7 +136,8 @@ def train(rank, a, h):
             loss_disc_all = loss_disc_s + loss_disc_f
 
             loss_disc_all.backward()
-            torch.nn.utils.clip_grad_norm_(optim_d.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(mpd.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(msd.parameters(), 0.5)
             optim_d.step()
 
             # Generator
@@ -154,7 +155,7 @@ def train(rank, a, h):
             loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
 
             loss_gen_all.backward()
-            torch.nn.utils.clip_grad_norm_(optim_g.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), 0.5)
             optim_g.step()
 
             if rank == 0:
