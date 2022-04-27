@@ -191,7 +191,7 @@ class MelDataset(torch.utils.data.Dataset):
             audio, sampling_rate = load_wav(filename)
             audio = audio / MAX_WAV_VALUE
             if not self.fine_tuning:
-                audio = normalize(audio) * 0.95
+                audio = _rms_norm(audio)
             self.cached_wav = audio
             if sampling_rate != self.sampling_rate:
                 raise ValueError(
