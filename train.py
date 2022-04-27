@@ -16,6 +16,7 @@ from env import AttrDict, build_env
 from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
 from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
     discriminator_loss
+from UNet import miniUNet, UNet
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
 
 torch.backends.cudnn.benchmark = True
@@ -29,16 +30,19 @@ def train(rank, a, h):
     torch.cuda.manual_seed(h.seed)
     device = torch.device('cuda:{:d}'.format(rank))
 
+    prenet = UNet().to(device)
     generator = Generator(h).to(device)
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
 
     if rank == 0:
+        print(prenet)
         print(generator)
         os.makedirs(a.checkpoint_path, exist_ok=True)
         print("checkpoints directory : ", a.checkpoint_path)
 
     if os.path.isdir(a.checkpoint_path):
+        cp_pre = scan_checkpoint(a.checkpoint_path, 'pre_')
         cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
         cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
 
@@ -47,6 +51,9 @@ def train(rank, a, h):
         state_dict_do = None
         last_epoch = -1
     else:
+        if cp_pre is not None:
+            state_dict_pre = load_checkpoint(cp_pre, device)
+            prenet.load_state_dict(state_dict_pre['prenet'])
         state_dict_g = load_checkpoint(cp_g, device)
         state_dict_do = load_checkpoint(cp_do, device)
         generator.load_state_dict(state_dict_g['generator'])
@@ -56,19 +63,21 @@ def train(rank, a, h):
         last_epoch = state_dict_do['epoch']
 
     if h.num_gpus > 1:
+        prenet = DistributedDataParallel(prenet, device_ids=[rank]).to(device)
         generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
         mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
         msd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
 
-    optim_g = torch.optim.AdamW(generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+    optim_g = torch.optim.AdamW(itertools.chain(generator.parameters(), prenet.parameters()), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
     optim_d = torch.optim.AdamW(itertools.chain(msd.parameters(), mpd.parameters()),
                                 h.learning_rate, betas=[h.adam_b1, h.adam_b2])
 
     if state_dict_do is not None:
-        optim_g.load_state_dict(state_dict_do['optim_g'])
+        if cp_pre is not None:
+            optim_g.load_state_dict(state_dict_do['optim_g'])
         optim_d.load_state_dict(state_dict_do['optim_d'])
 
-    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
+    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch if cp_pre else -1)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
 
     training_filelist, validation_filelist = get_dataset_filelist(a)
@@ -99,6 +108,7 @@ def train(rank, a, h):
 
         sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
 
+    prenet.train()
     generator.train()
     mpd.train()
     msd.train()
@@ -113,13 +123,16 @@ def train(rank, a, h):
         for i, batch in enumerate(train_loader):
             if rank == 0:
                 start_b = time.time()
-            x, y, _, y_mel = batch
+            x, y, _, y_mel, y_mel_pre = batch
             x = torch.autograd.Variable(x.to(device, non_blocking=True))
             y = torch.autograd.Variable(y.to(device, non_blocking=True))
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
+            y_mel_pre = torch.autograd.Variable(y_mel_pre.to(device, non_blocking=True))
             y = y.unsqueeze(1)
 
-            y_g_hat = generator(x)
+            y_mel_pre_hat = prenet(x)
+
+            y_g_hat = generator(y_mel_pre_hat)
             y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
                                           h.fmin, h.fmax_for_loss)
 
@@ -145,6 +158,7 @@ def train(rank, a, h):
 
             # L1 Mel-Spectrogram Loss
             loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
+            loss_mel_pre = F.l1_loss(y_mel_pre, y_mel_pre_hat) * 45
 
             y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
             y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
@@ -152,10 +166,11 @@ def train(rank, a, h):
             loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
             loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
             loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
+            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel + loss_mel_pre
 
             loss_gen_all.backward()
             torch.nn.utils.clip_grad_norm_(generator.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(prenet.parameters(), 0.5)
             optim_g.step()
 
             if rank == 0:
@@ -163,12 +178,16 @@ def train(rank, a, h):
                 if steps % a.stdout_interval == 0:
                     with torch.no_grad():
                         mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
+                        mel_pre_error = F.l1_loss(y_mel_pre, y_mel_pre_hat).item()
 
-                    print('Steps : {:d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, s/b : {:4.3f}'.
-                          format(steps, loss_gen_all, mel_error, time.time() - start_b))
+                    print('Steps : {:d}, Gen : {:4.3f}, Mel : {:4.3f}, Mel-pre : {:4.3f}, s/b : {:4.3f}'.
+                          format(steps, loss_gen_all, mel_error, mel_pre_error, time.time() - start_b))
 
                 # checkpointing
                 if steps % a.checkpoint_interval == 0 and steps != 0:
+                    checkpoint_path = "{}/pre_{:08d}".format(a.checkpoint_path, steps)
+                    save_checkpoint(checkpoint_path,
+                                    {'prenet': (prenet.module if h.num_gpus > 1 else prenet).state_dict()})
                     checkpoint_path = "{}/g_{:08d}".format(a.checkpoint_path, steps)
                     save_checkpoint(checkpoint_path,
                                     {'generator': (generator.module if h.num_gpus > 1 else generator).state_dict()})
@@ -185,16 +204,19 @@ def train(rank, a, h):
                 if steps % a.summary_interval == 0:
                     sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
                     sw.add_scalar("training/mel_spec_error", mel_error, steps)
+                    sw.add_scalar("training/mel_spec_pre_error", mel_pre_error, steps)
 
                 # Validation
                 if steps % a.validation_interval == 0:  # and steps != 0:
+                    prenet.eval()
                     generator.eval()
                     torch.cuda.empty_cache()
                     val_err_tot = 0
                     with torch.no_grad():
                         for j, batch in enumerate(validation_loader):
-                            x, y, _, y_mel = batch
-                            y_g_hat = generator(x.to(device))
+                            x, y, _, y_mel, y_mel_pre = batch
+                            y_mel_pre_hat = prenet(x.to(device))
+                            y_g_hat = generator(y_mel_pre_hat)
                             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
                             y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
                                                           h.hop_size, h.win_size,
@@ -202,20 +224,19 @@ def train(rank, a, h):
                             val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
                             if j <= 4:
-                                if steps == 0:
-                                    sw.add_audio('gt/y_{}'.format(j), y[0], steps, h.sampling_rate)
-                                    sw.add_figure('gt/y_spec_{}'.format(j), plot_spectrogram(x[0]), steps)
-
+                                sw.add_figure('gt/x_spec_{}'.format(j), plot_spectrogram(x[0].squeeze().cpu().numpy()), steps)
+                                sw.add_audio('gt/y_{}'.format(j), y[0], steps, h.sampling_rate)
+                                sw.add_figure('gt/y_spec_{}'.format(j), plot_spectrogram(y_mel[0].squeeze().cpu().numpy()), steps)
                                 sw.add_audio('generated/y_hat_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
-                                y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels,
-                                                             h.sampling_rate, h.hop_size, h.win_size,
-                                                             h.fmin, h.fmax)
                                 sw.add_figure('generated/y_hat_spec_{}'.format(j),
-                                              plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
+                                              plot_spectrogram(y_g_hat_mel.squeeze().cpu().numpy()), steps)
+                                sw.add_figure('generated/y_hat_pre_{}'.format(j),
+                                              plot_spectrogram(y_mel_pre_hat.squeeze().cpu().numpy()), steps)
 
                         val_err = val_err_tot / (j+1)
                         sw.add_scalar("validation/mel_spec_error", val_err, steps)
-
+                    
+                    prenet.train()
                     generator.train()
 
             steps += 1

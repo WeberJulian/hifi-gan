@@ -178,7 +178,7 @@ class MelDataset(torch.utils.data.Dataset):
                         config.rir_path, leave_length_unchanged=True, p=0.666
                     ),
                     AddGaussianSNR(min_snr_in_db=30, max_snr_in_db=60, p=0.666),
-                    SevenBandParametricEQ(p=0.666, min_gain_db=-6.0, max_gain_db=6.0),
+                    SevenBandParametricEQ(p=0.666, min_gain_db=-5.0, max_gain_db=5.0),
                     Mp3Compression(
                         backend="pydub", max_bitrate=64, min_bitrate=16, p=0.1
                     ),
@@ -272,6 +272,18 @@ class MelDataset(torch.utils.data.Dataset):
                         audio, (0, self.segment_size - audio.size(1)), "constant"
                     )
 
+        pre_mel_loss = mel_spectrogram(
+            audio,
+            self.n_fft,
+            self.num_mels,
+            self.sampling_rate,
+            self.hop_size,
+            self.win_size,
+            self.fmin,
+            self.fmax,
+            center=False,
+        )
+
         mel_loss = mel_spectrogram(
             audio,
             self.n_fft,
@@ -284,7 +296,7 @@ class MelDataset(torch.utils.data.Dataset):
             center=False,
         )
 
-        return (mel.squeeze(), audio.squeeze(0), filename, mel_loss.squeeze())
+        return (mel.squeeze(), audio.squeeze(0), filename, mel_loss.squeeze(), pre_mel_loss.squeeze())
 
     def __len__(self):
         return len(self.audio_files)
