@@ -80,11 +80,11 @@ def mel_spectrogram(
         hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
 
     y = torch.nn.functional.pad(
-        y.unsqueeze(1),
+        y.unsqueeze(0),
         (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)),
         mode="reflect",
     )
-    y = y.squeeze(1)
+    y = y.squeeze()
 
     spec = torch.stft(
         y,
@@ -159,29 +159,15 @@ class MelDataset(torch.utils.data.Dataset):
         self.device = device
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
+        self.resample_down = torchaudio.transforms.Resample(self.config.sampling_rate, self.config.sampling_rate // 3)
         if self.augment:
-            self.resample_down = torchaudio.transforms.Resample(sampling_rate, 16000)
-            self.resample_up = torchaudio.transforms.Resample(
-                16000,
-                sampling_rate,
-                lowpass_filter_width=64,
-                rolloff=0.9475937167399596,
-                resampling_method="kaiser_window",
-                beta=14.769656459379492,
-            )
             self.augmentor = Compose(
                 [
-                    AddBackgroundNoise(
-                        config.noise_path, max_snr_in_db=55, min_snr_in_db=30, p=0.5
-                    ),
-                    ApplyImpulseResponse(
-                        config.rir_path, leave_length_unchanged=True, p=0.666
-                    ),
+                    AddBackgroundNoise(config.noise_path, max_snr_in_db=55, min_snr_in_db=30, p=0.5),
+                    ApplyImpulseResponse(config.rir_path, leave_length_unchanged=True, p=0.666),
                     AddGaussianSNR(min_snr_in_db=30, max_snr_in_db=60, p=0.666),
-                    SevenBandParametricEQ(p=0.666, min_gain_db=-6.0, max_gain_db=6.0),
-                    Mp3Compression(
-                        backend="pydub", max_bitrate=64, min_bitrate=16, p=0.1
-                    ),
+                    SevenBandParametricEQ(p=0.666, min_gain_db=-4.0, max_gain_db=4.0),
+                    Mp3Compression(backend="pydub", max_bitrate=64, min_bitrate=16, p=0.1),
                 ]
             )
 
@@ -207,72 +193,26 @@ class MelDataset(torch.utils.data.Dataset):
         audio = torch.FloatTensor(audio)
         audio = audio.unsqueeze(0)
 
-        if not self.fine_tuning:
-            if self.split:
-                if audio.size(1) >= self.segment_size:
-                    max_audio_start = audio.size(1) - self.segment_size
-                    audio_start = random.randint(0, max_audio_start)
-                    audio = audio[:, audio_start : audio_start + self.segment_size]
-                else:
-                    audio = torch.nn.functional.pad(
-                        audio, (0, self.segment_size - audio.size(1)), "constant"
-                    )
-            if self.config.augment:
-                augmented_audio = self.augment(audio)
-            use_augmented = hasattr(augmented_audio, "shape") and (
-                augmented_audio.shape == audio.shape
-            )
-            if not use_augmented:
-                print(
-                    "Shape missmatch, audio not augmented",
-                    audio.shape,
-                    augmented_audio.shape,
+        if self.split:
+            if audio.size(1) >= self.segment_size:
+                max_audio_start = audio.size(1) - self.segment_size
+                audio_start = random.randint(0, max_audio_start)
+                audio = audio[:, audio_start : audio_start + self.segment_size]
+            else:
+                audio = torch.nn.functional.pad(
+                    audio, (0, self.segment_size - audio.size(1)), "constant"
                 )
+        audio = audio.squeeze()
+        if len(audio) %3 != 0:
+            audio = audio[:-(len(audio) % 3)]
 
-            mel = mel_spectrogram(
-                augmented_audio if use_augmented else audio,
-                self.n_fft,
-                self.num_mels,
-                self.sampling_rate,
-                self.hop_size,
-                self.win_size,
-                self.fmin,
-                self.fmax,
-                center=False,
-            )
-        else:
-            mel = np.load(
-                os.path.join(
-                    self.base_mels_path,
-                    os.path.splitext(os.path.split(filename)[-1])[0] + ".npy",
-                )
-            )
-            mel = torch.from_numpy(mel)
+        augmented_audio = self.resample_down(audio)
 
-            if len(mel.shape) < 3:
-                mel = mel.unsqueeze(0)
+        if self.config.augment:
+            augmented_audio = self.augment(augmented_audio)
 
-            if self.split:
-                frames_per_seg = math.ceil(self.segment_size / self.hop_size)
 
-                if audio.size(1) >= self.segment_size:
-                    mel_start = random.randint(0, mel.size(2) - frames_per_seg - 1)
-                    mel = mel[:, :, mel_start : mel_start + frames_per_seg]
-                    audio = audio[
-                        :,
-                        mel_start
-                        * self.hop_size : (mel_start + frames_per_seg)
-                        * self.hop_size,
-                    ]
-                else:
-                    mel = torch.nn.functional.pad(
-                        mel, (0, frames_per_seg - mel.size(2)), "constant"
-                    )
-                    audio = torch.nn.functional.pad(
-                        audio, (0, self.segment_size - audio.size(1)), "constant"
-                    )
-
-        mel_loss = mel_spectrogram(
+        mel = mel_spectrogram(
             audio,
             self.n_fft,
             self.num_mels,
@@ -284,23 +224,17 @@ class MelDataset(torch.utils.data.Dataset):
             center=False,
         )
 
-        return (mel.squeeze(), audio.squeeze(0), filename, mel_loss.squeeze())
+        return (augmented_audio, audio, filename, mel)
 
     def __len__(self):
         return len(self.audio_files)
 
-    def augment(self, audio):
-        target_len = audio.size(1)
-        augmented_audio = self.resample_down(audio)
-        augmented_audio = augmented_audio.squeeze(0).cpu().float().numpy()
+    def augment(self, augmented_audio, sampling_rate=16000):
+        augmented_audio = augmented_audio.cpu().float().numpy()
         augmented_audio = self.augmentor(
             samples=augmented_audio,
-            sample_rate=16000,
+            sample_rate=sampling_rate,
         )
         augmented_audio = _rms_norm(augmented_audio)
-        augmented_audio = torch.FloatTensor(augmented_audio).unsqueeze(0)
-        augmented_audio = self.resample_up(augmented_audio)
-        diff = augmented_audio.size(1) - target_len
-        if diff > 0 and diff <= 3:
-            augmented_audio = augmented_audio[:,:-diff]
+        augmented_audio = torch.FloatTensor(augmented_audio).squeeze()
         return augmented_audio

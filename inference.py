@@ -53,8 +53,7 @@ def inference(a):
                 wav = wav / MAX_WAV_VALUE
             wav = _rms_norm(wav)
             wav = torch.FloatTensor(wav).to(device)
-            x = get_mel(wav.unsqueeze(0))
-            y_g_hat = generator(x)
+            y_g_hat = generator(wav.unsqueeze(0))
             audio = y_g_hat.squeeze()
             audio = audio * MAX_WAV_VALUE
             audio = audio.cpu().numpy().astype('int16')
